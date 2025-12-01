@@ -1,0 +1,302 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+const int SENSOR_PIN = 33;      // 传感器连接的引脚
+const int LED_PIN = 2;          // 板载LED引脚（通常是GPIO2）
+
+bool lastState = false;         // 上一次的状态
+bool currentState = false;      // 当前状态
+bool systemBooted = false;      // 系统是否已启动完成
+unsigned long lastLedBlink = 0; // LED闪烁计时
+bool ledState = false;          // LED当前状态
+
+// 状态无变化检测相关变量
+unsigned long lastStateChangeTime = 0;  // 上次状态变化的时间
+unsigned long lastStatePublishTime = 0; // 上次状态发布的时间
+const unsigned long STATE_CHANGE_INTERVAL = 5 * 60 * 1000; // 5分钟（毫秒）
+
+// WiFi配置
+const char* ssid = "Saturn-Guest-2.4g";
+const char* password = "Tuxingkeji-0918";
+
+// MQTT配置 - 请根据实际情况修改
+const char* mqttServer = "8.153.160.138";  // MQTT服务器IP
+const int mqttPort = 1883;                       // MQTT端口
+const char* mqttTopic = "txkj/jokker_destop/person_occupancy";            // MQTT主题
+const char* mqttStatusTopic = "txkj/jokker_destop/occupancy_status";      // 状态主题
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+bool mqttConnected = false;
+bool wifiConnected = false;
+
+// 函数前置声明
+void connectToWiFi();
+void connectToMQTT();
+void sendStateToMQTT(bool state, const char* changeType = "state_change");
+void sendBootMessage();
+void blinkLED(int interval);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void checkStateTimeout();
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(SENSOR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  Serial.println("人体检测系统启动中...");
+  Serial.println("==========================");
+  
+  // 连接WiFi
+  connectToWiFi();
+  
+  // 配置MQTT
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  
+  // 连接MQTT
+  connectToMQTT();
+  
+  // 初始化状态变化时间
+  lastStateChangeTime = millis();
+  lastStatePublishTime = millis();
+  
+  systemBooted = true;
+  Serial.println("人体检测系统启动完成");
+  Serial.println("==========================");
+  
+  // 发送重启消息
+  sendBootMessage();
+}
+
+void connectToWiFi() {
+  unsigned long wifiStartTime = millis();
+  int blinkCount = 0;
+  
+  Serial.print("正在连接WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    // LED快速闪烁（每秒2次）
+    if (millis() - lastLedBlink > 250) {
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      lastLedBlink = millis();
+      blinkCount++;
+    }
+    
+    if (blinkCount % 8 == 0) { // 每2秒打印一次状态
+      Serial.print(".");
+    }
+    
+    // 每30秒检查一次，如果还是连接失败，重新开始连接
+    if (millis() - wifiStartTime > 30000) {
+      Serial.println("\nWiFi连接超时，重新尝试...");
+      WiFi.disconnect();
+      delay(1000);
+      WiFi.begin(ssid, password);
+      wifiStartTime = millis();
+      blinkCount = 0;
+    }
+    
+    delay(10);
+  }
+  
+  // WiFi连接成功，LED常亮
+  digitalWrite(LED_PIN, HIGH);
+  wifiConnected = true;
+  Serial.println("\nWiFi连接成功!");
+  Serial.print("IP地址: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectToMQTT() {
+  if (!wifiConnected) {
+    Serial.println("WiFi未连接，无法连接MQTT");
+    return;
+  }
+  
+  Serial.print("正在连接MQTT服务器: ");
+  Serial.print(mqttServer);
+  Serial.print(":");
+  Serial.println(mqttPort);
+  
+  // 尝试连接MQTT
+  if (mqttClient.connect("ESP32_PIR_Sensor")) {
+    mqttConnected = true;
+    Serial.println("MQTT连接成功!");
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    mqttConnected = false;
+    Serial.print("MQTT连接失败，错误代码: ");
+    Serial.println(mqttClient.state());
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // 可以在这里处理接收到的MQTT消息
+  Serial.print("收到MQTT消息: ");
+  Serial.println(topic);
+}
+
+void sendBootMessage() {
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT未连接，无法发送重启消息");
+    connectToMQTT();
+    if (!mqttClient.connected()) {
+      return;
+    }
+  }
+  
+  String ipAddress = WiFi.localIP().toString();
+  String message = "{\"event\":\"reboot\",\"ip\":\"" + ipAddress + 
+                   "\",\"message\":\"系统重启完成\",\"timestamp\":\"" + 
+                   String(millis()) + "\"}";
+  
+  if (mqttClient.publish(mqttStatusTopic, message.c_str())) {
+    Serial.println("✅ 重启消息发送成功");
+  } else {
+    Serial.println("❌ 重启消息发送失败");
+  }
+}
+
+void sendStateToMQTT(bool state, const char* changeType) {
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT未连接，无法发送状态消息");
+    connectToMQTT();
+    if (!mqttClient.connected()) {
+      return;
+    }
+  }
+  
+  String message;
+  String ipAddress = WiFi.localIP().toString();
+  String changeTypeStr = changeType;
+  
+  if (state) {
+    message = "{\"state\":\"occupied\",\"ip\":\"" + ipAddress + 
+              "\",\"message\":\"检测到有人\",\"timestamp\":\"" + 
+              String(millis()) + "\",\"change_type\":\"" + changeTypeStr + "\"}";
+    if (changeTypeStr == "state_change") {
+      Serial.println("🔴 检测到有人 - 发送MQTT消息");
+    } else {
+      Serial.println("🔴 检测到有人 - 定时发送状态消息");
+    }
+  } else {
+    message = "{\"state\":\"unoccupied\",\"ip\":\"" + ipAddress + 
+              "\",\"message\":\"无人状态\",\"timestamp\":\"" + 
+              String(millis()) + "\",\"change_type\":\"" + changeTypeStr + "\"}";
+    if (changeTypeStr == "state_change") {
+      Serial.println("🟢 无人 - 发送MQTT消息");
+    } else {
+      Serial.println("🟢 无人 - 定时发送状态消息");
+    }
+  }
+  
+  if (mqttClient.publish(mqttTopic, message.c_str())) {
+    Serial.println("✅ 状态消息发送成功");
+    lastStatePublishTime = millis(); // 更新最后发布状态的时间
+  } else {
+    Serial.println("❌ 状态消息发送失败");
+  }
+}
+
+void blinkLED(int interval) {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastLedBlink >= interval) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    lastLedBlink = currentMillis;
+  }
+}
+
+void checkConnections() {
+  // 检查WiFi连接状态
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    mqttConnected = false;
+    Serial.println("WiFi连接丢失，尝试重新连接...");
+    connectToWiFi();
+  }
+  
+  // 检查MQTT连接状态
+  if (wifiConnected && !mqttClient.connected()) {
+    mqttConnected = false;
+    connectToMQTT();
+  }
+}
+
+void checkStateTimeout() {
+  unsigned long currentTime = millis();
+  
+  // 检查是否5分钟没有状态变化
+  if (currentTime - lastStateChangeTime >= STATE_CHANGE_INTERVAL) {
+    // 检查是否已经发送过定时状态（避免连续发送）
+    if (currentTime - lastStatePublishTime >= STATE_CHANGE_INTERVAL) {
+      Serial.println("⏰ 5分钟无状态变化，发送当前状态");
+      sendStateToMQTT(currentState, "timeout");
+    }
+  }
+}
+
+void loop() {
+  // 维持MQTT连接
+  mqttClient.loop();
+  
+  // 定期检查连接状态（每5秒检查一次）
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    checkConnections();
+    lastCheck = millis();
+  }
+  
+  // 检查状态超时（每30秒检查一次）
+  static unsigned long lastTimeoutCheck = 0;
+  if (millis() - lastTimeoutCheck > 30000) {
+    checkStateTimeout();
+    lastTimeoutCheck = millis();
+  }
+  
+  // 根据连接状态控制LED
+  if (!wifiConnected) {
+    // WiFi未连接，快速闪烁
+    blinkLED(250);
+  } else if (!mqttConnected) {
+    // WiFi已连接但MQTT未连接，中速闪烁
+    blinkLED(500);
+  } else {
+    // 全部连接正常，LED常亮
+    digitalWrite(LED_PIN, HIGH);
+  }
+  
+  // 读取传感器状态
+  currentState = digitalRead(SENSOR_PIN);
+  
+  // 只有当状态发生变化时才处理
+  if (currentState != lastState) {
+    if (currentState == HIGH) {
+      Serial.println("🔴 检测到有人");
+    } else {
+      Serial.println("🟢 无人");
+    }
+    
+    // 发送MQTT消息
+    if (systemBooted) {
+      sendStateToMQTT(currentState, "state_change");
+    }
+    
+    // 更新状态变化时间
+    lastStateChangeTime = millis();
+    
+    // 更新上一次的状态
+    lastState = currentState;
+  }
+  
+  delay(100);  // 每100ms检测一次
+}
