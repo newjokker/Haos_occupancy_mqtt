@@ -1,84 +1,51 @@
 #include <Arduino.h>
-#include <esp_sleep.h> 
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 
-#define WAKEUP_PIN   3  // 唤醒引脚
-#define STATUS_PIN   8  // 状态指示灯引脚
-
-// 全局变量，记录下一次应该等待的唤醒条件
-bool nextWakeupHigh = true;  // true=等待高电平, false=等待低电平
-
-void handlePresence();
-void handleAbsence();
-void setupNextWakeup();
+#define WAKE_PIN GPIO_NUM_2   // 推荐 GPIO2 做人体感应输入
+#define LED_PIN  GPIO_NUM_8   // SuperMini 的板载LED通常在 GPIO8（高亮、低灭）
 
 void setup() {
   Serial.begin(115200);
-  
-  pinMode(STATUS_PIN, OUTPUT);
-  pinMode(WAKEUP_PIN, INPUT_PULLUP);
-  
-  digitalWrite(STATUS_PIN, HIGH); // LED亮起表示活跃状态
-  
-  // 显示当前唤醒原因和引脚状态
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  
-  if(wakeup_reason == ESP_SLEEP_WAKEUP_GPIO) {
-    Serial.println("🔔 GPIO唤醒事件");
+  delay(200);
+
+  pinMode(WAKE_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  // 显示唤醒原因
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  Serial.printf("Wakeup reason: %d\n", cause);
+
+  int level = digitalRead(WAKE_PIN);
+  Serial.printf("Current pin level: %d\n", level);
+
+  if(level == HIGH) {
+    digitalWrite(LED_PIN, LOW);   // 低亮灯
+    Serial.println("Detected HIGH (有人)");
   } else {
-    Serial.println("🚀 首次启动或复位唤醒");
+    digitalWrite(LED_PIN, HIGH);  // 高灭灯
+    Serial.println("Detected LOW (无人)");
+  }
+
+  delay(1000);
+
+  Serial.println("Config wakeup on HIGH...");
+  
+  // 对于 ESP32-C3，使用 gpio_wakeup_enable 和 esp_sleep_enable_gpio_wakeup
+  esp_err_t result = gpio_wakeup_enable(WAKE_PIN, GPIO_INTR_HIGH_LEVEL);
+  if (result != ESP_OK) {
+    Serial.printf("Error enabling gpio wakeup: %d\n", result);
   }
   
-  Serial.print("当前引脚状态: ");
-  Serial.println(digitalRead(WAKEUP_PIN) == HIGH ? "HIGH" : "LOW");
-  
-  // 根据当前引脚状态执行相应任务
-  if (digitalRead(WAKEUP_PIN) == HIGH) {
-    Serial.println("🔴 检测到高电平状态");
-    handlePresence();
-  } else {
-    Serial.println("🟢 检测到低电平状态"); 
-    handleAbsence();
+  result = esp_sleep_enable_gpio_wakeup();
+  if (result != ESP_OK) {
+    Serial.printf("Error enabling sleep wakeup: %d\n", result);
   }
-  
-  setupNextWakeup();
-}
 
-void loop() {
-  // 不会执行
-}
-
-void handlePresence() {
-  Serial.println("执行高电平状态任务...");
-  delay(1000); 
-  
-  // 固定设置下一次为低电平唤醒
-  Serial.println("📋 设置下次唤醒条件: 低电平");
-  nextWakeupHigh = false;
-}
-
-void handleAbsence() {
-  Serial.println("执行低电平状态任务...");
-  delay(1000); 
-  
-  // 固定设置下一次为高电平唤醒
-  Serial.println("📋 设置下次唤醒条件: 高电平");
-  nextWakeupHigh = true;
-}
-
-void setupNextWakeup() {
-  // 根据全局变量设置唤醒条件
-  esp_sleep_enable_gpio_wakeup();
-  
-  if(nextWakeupHigh) {
-    Serial.println("⏰ 等待高电平唤醒...");
-    gpio_wakeup_enable((gpio_num_t)WAKEUP_PIN, GPIO_INTR_HIGH_LEVEL);
-  } else {
-    Serial.println("⏰ 等待低电平唤醒...");
-    gpio_wakeup_enable((gpio_num_t)WAKEUP_PIN, GPIO_INTR_LOW_LEVEL);
-  }
-  
-  Serial.println("进入深度睡眠...");
+  Serial.println("Going to deep sleep now...");
   Serial.flush();
-  digitalWrite(STATUS_PIN, LOW); // LED熄灭
+  delay(50);
   esp_deep_sleep_start();
 }
+
+void loop() {}
